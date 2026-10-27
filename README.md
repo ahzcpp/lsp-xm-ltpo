@@ -44,33 +44,46 @@ public DesiredDisplayModeSpecs getDesiredDisplayModeSpecs(int displayId) {
 1. 需要 Root（Magisk / KernelSU / APatch）+ LSPosed
 2. 装 APK，在 LSPosed 里启用，**作用域勾 `android`**（部分版本显示为 `system_server`）
 3. 重启
-4. 设目标档位：
 
-```sh
-su -c "setprop persist.sys.rrlock.hz max"
+**没有第四步。** 装上就自动跟随你在系统里选的档位——你切到 132 就全程 132，切到 144 就全程 144，锁屏、息屏、静止都不会掉。
+
+### 跟随是怎么做的
+
+模块在独立线程上监听这几个设置项，哪个有值就用哪个：
+
+```
+secure/miui_refresh_rate   HyperOS 2/3
+secure/user_refresh_rate   HyperOS 1
+system/peak_refresh_rate   AOSP
+system/user_refresh_rate
 ```
 
-`persist.` 属性重启后仍在，设一次就行。
+值是 `1` 的（部分底包用它表示"最高"）按最高档处理。
 
-## 配置
+读 Settings 全部在独立线程上做，Hook 里只读一个 volatile 变量——
+`getDesiredDisplayModeSpecs` 是在显示锁里跑的，在那里面碰 ContentResolver 有死锁风险。
 
-属性 `persist.sys.rrlock.hz`：
+## 可选：手动指定档位
+
+默认不需要配置。想钉死某个值不跟随，设属性 `persist.sys.rrlock.hz`：
 
 | 值 | 行为 |
 |---|---|
+| 未设置 / `follow` | **跟随系统所选档位（默认）** |
 | `max` | 钉在这块屏支持的最高档 |
 | 数字（如 `120`、`144`） | 钉在该档位；档位表里没有就不生效 |
-| `0` / `off` / 未设置 | 模块不做任何事 |
+| `0` / `off` | 模块停用 |
 
-改完**立即生效**，不用重启（模块每秒重读一次）。想换档位就改这个属性。
+改完立即生效，不用重启。
 
-出问题随时退回：
+出问题随时退回：`su -c "setprop persist.sys.rrlock.hz 0"`，或者在 LSPosed 里关掉模块。
 
-```sh
-su -c "setprop persist.sys.rrlock.hz 0"
-```
+## 和 Magisk 模块的关系
 
-或者在 LSPosed 里关掉模块。
+本模块在 framework 最终出口上改结果，**优先级高于一切属性和 settings**。
+如果你装过改 `ro.vendor.display.fod_monitor_default_fps`、`ro.vendor.mi_sf.*`
+之类的 Magisk 模块，建议卸掉——那些是在上游跟投票者打，和本模块同时存在
+只会让现象变乱，没有叠加收益。
 
 ## 怎么确认生效
 

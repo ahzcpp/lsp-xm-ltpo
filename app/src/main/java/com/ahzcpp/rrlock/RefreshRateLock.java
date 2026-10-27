@@ -1,5 +1,12 @@
 package com.ahzcpp.rrlock;
 
+import android.content.ContentResolver;
+import android.content.Context;
+import android.database.ContentObserver;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.provider.Settings;
 import android.util.SparseArray;
 import android.view.Display;
 
@@ -32,8 +39,15 @@ public class RefreshRateLock implements IXposedHookLoadPackage {
 
     private static final String TAG = "[RRLock] ";
 
-    /** 目标档位。max=最高档；数字=该档位；0/未设置=不生效 */
+    /**
+     * 可选覆盖。未设置 = 自动跟随系统所选档位（默认）；
+     * follow=同上；max=最高档；数字=该档位；0/off=停用。
+     */
     private static final String PROP = "persist.sys.rrlock.hz";
+
+    /** 系统里选的档位，由后台线程更新，Hook 里只读 —— 绝不在显示锁内访问 Settings */
+    private static volatile float sFollowHz;
+    private static volatile boolean sWatcherStarted;
 
     private static final String[] DIRECTOR_CLASSES = {
             // Android 14 起挪进了 .mode 子包
@@ -84,7 +98,21 @@ public class RefreshRateLock implements IXposedHookLoadPackage {
         if (specs == null) return;
 
         String cfg = readProp();
-        if (cfg.isEmpty() || "0".equals(cfg) || "off".equalsIgnoreCase(cfg)) return;
+        if ("0".equals(cfg) || "off".equalsIgnoreCase(cfg)) return;
+
+        startWatcherOnce(p.thisObject);
+
+        // 未设置属性 = 跟随系统所选档位（默认行为）
+        if (cfg.isEmpty() || "follow".equalsIgnoreCase(cfg) || "auto".equalsIgnoreCase(cfg)) {
+            float f = sFollowHz;
+            if (f == -1f) {
+                cfg = "max";              // 部分底包用 1 表示"最高"
+            } else if (f > 0f) {
+                cfg = String.valueOf(f);
+            } else {
+                return;                   // 还没读到档位，先不动
+            }
+        }
 
         int displayId = (p.args.length > 0 && p.args[0] instanceof Integer)
                 ? (Integer) p.args[0] : 0;
@@ -235,6 +263,95 @@ public class RefreshRateLock implements IXposedHookLoadPackage {
             }
         }
         return null;
+    }
+
+
+    // ---------------------------------------------------------------
+    //  跟随系统所选档位
+    //  全部在独立线程上读 Settings，Hook 里只读一个 volatile。
+    //  getDesiredDisplayModeSpecs 是在 mLock 里跑的，绝不能在那里面
+    //  碰 ContentResolver，否则有死锁风险。
+    // ---------------------------------------------------------------
+
+    private static final String[][] KEYS = {
+            {"secure", "miui_refresh_rate"},     // HyperOS 2/3
+            {"secure", "user_refresh_rate"},     // HyperOS 1
+            {"system", "peak_refresh_rate"},     // AOSP
+            {"system", "user_refresh_rate"},
+    };
+
+    private static synchronized void startWatcherOnce(Object director) {
+        if (sWatcherStarted) return;
+        Context ctx;
+        try {
+            Object o = XposedHelpers.getObjectField(director, "mContext");
+            if (!(o instanceof Context)) return;
+            ctx = (Context) o;
+        } catch (Throwable t) {
+            return;
+        }
+        sWatcherStarted = true;
+        try {
+            final ContentResolver cr = ctx.getContentResolver();
+            HandlerThread th = new HandlerThread("rrlock-settings");
+            th.start();
+            final Handler h = new Handler(th.getLooper());
+
+            ContentObserver obs = new ContentObserver(h) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    refresh(cr);
+                }
+            };
+            for (String[] k : KEYS) {
+                Uri u = "secure".equals(k[0])
+                        ? Settings.Secure.getUriFor(k[1])
+                        : Settings.System.getUriFor(k[1]);
+                try {
+                    cr.registerContentObserver(u, false, obs);
+                } catch (Throwable ignored) {
+                }
+            }
+
+            // 开机早期 settings 可能还没就绪，兜一个低频重读
+            h.post(new Runnable() {
+                @Override
+                public void run() {
+                    refresh(cr);
+                    h.postDelayed(this, 10000L);
+                }
+            });
+            XposedBridge.log(TAG + "已开始跟随系统所选档位");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "跟随启动失败: " + t);
+        }
+    }
+
+    private static void refresh(ContentResolver cr) {
+        float hz = 0f;
+        for (String[] k : KEYS) {
+            String v;
+            try {
+                v = "secure".equals(k[0])
+                        ? Settings.Secure.getString(cr, k[1])
+                        : Settings.System.getString(cr, k[1]);
+            } catch (Throwable t) {
+                continue;
+            }
+            if (v == null || v.isEmpty()) continue;
+            float f;
+            try {
+                f = Float.parseFloat(v.trim());
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (f == 1f) { hz = -1f; break; }          // 1 = 最高档
+            if (f >= 30f && f <= 480f) { hz = f; break; }
+        }
+        if (hz != sFollowHz) {
+            sFollowHz = hz;
+            XposedBridge.log(TAG + "跟随到档位: " + (hz == -1f ? "最高档" : hz + "Hz"));
+        }
     }
 
     /** 读属性，缓存 1 秒，避免高频反射 */
