@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,8 +19,32 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
       - run: gradle assembleDebug --stacktrace
+
+      - name: 收集 APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/*.apk dist/RefreshRateLock.apk
+          sha256sum dist/RefreshRateLock.apk | tee dist/RefreshRateLock.apk.sha256
+
       - uses: actions/upload-artifact@v4
         with:
-          name: RefreshRateLock-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: RefreshRateLock
+          path: dist/*
+
+      - name: 把 APK 提交回仓库
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist/
+          git diff --staged --quiet || git commit -m "build: 更新 dist/RefreshRateLock.apk [skip ci]"
+          git push
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" dist/RefreshRateLock.apk \
+            --title "RefreshRateLock v1.0.${{ github.run_number }}" \
+            --notes "LSPosed 模块：把屏幕刷新率钉死在指定档位。装后在 LSPosed 启用、作用域勾 android、重启，再执行 \`su -c \"setprop persist.sys.rrlock.hz max\"\`。详见 README。"
